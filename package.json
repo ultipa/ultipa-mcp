@@ -1,0 +1,54 @@
+{
+  "name": "ultipa-mcp",
+  "version": "0.1.0",
+  "description": "Model Context Protocol server for Ultipa Cloud and any self-managed Ultipa GQLDB instance. Operate instances, run GQL, manage backups from any MCP client (Claude Desktop, Cursor, etc.).",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "ultipa-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc && chmod +x dist/index.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ultipa",
+    "gqldb",
+    "graph-database",
+    "gql",
+    "claude",
+    "cursor"
+  ],
+  "author": "Ultipa",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ultipa/ultipa-mcp.git"
+  },
+  "homepage": "https://github.com/ultipa/ultipa-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/ultipa/ultipa-mcp/issues"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@ultipa-graph/ultipa-driver": "^6.0.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  }
+}

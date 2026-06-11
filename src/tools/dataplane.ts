@@ -20,6 +20,89 @@ import {
   hasModeB,
 } from "../helpers/env.js";
 
+// Minimal RFC 4180-style CSV parser used by `import_data`'s CSV pass-through.
+// Handles quoted fields with commas/newlines inside, escaped quotes (`""` → `"`),
+// CRLF / LF line endings, UTF-8 BOM, and a missing trailing newline. Default
+// delimiter is `,`. For non-standard CSVs (custom delimiter, leading metadata
+// rows, exotic quoting), the agent should preprocess client-side and use the
+// canonical `nodes`/`edges` arrays instead.
+function parseCsv(text: string): string[][] {
+  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += c;
+      }
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ",") {
+      row.push(field);
+      field = "";
+    } else if (c === "\n") {
+      row.push(field);
+      rows.push(row);
+      row = [];
+      field = "";
+    } else if (c === "\r") {
+      // ignore; `\n` handles row break
+    } else {
+      field += c;
+    }
+  }
+  if (field !== "" || row.length > 0) {
+    row.push(field);
+    rows.push(row);
+  }
+  return rows;
+}
+
+// Coerce a raw CSV cell (always a string) into the requested type. Empty cells
+// become null. Unknown / passthrough types return the original string so the
+// server can do its own coercion if applicable.
+function coerceCell(value: string, type?: string): any {
+  if (value === "") return null;
+  if (!type) return value;
+  switch (type.toUpperCase()) {
+    case "INT":
+    case "INTEGER":
+    case "BIGINT": {
+      const n = parseInt(value, 10);
+      if (Number.isNaN(n))
+        throw new Error(`Cannot coerce "${value}" to INT`);
+      return n;
+    }
+    case "FLOAT":
+    case "DOUBLE": {
+      const f = parseFloat(value);
+      if (Number.isNaN(f))
+        throw new Error(`Cannot coerce "${value}" to FLOAT`);
+      return f;
+    }
+    case "BOOL":
+    case "BOOLEAN": {
+      const v = value.trim().toLowerCase();
+      if (["true", "t", "yes", "y", "1"].includes(v)) return true;
+      if (["false", "f", "no", "n", "0"].includes(v)) return false;
+      throw new Error(`Cannot coerce "${value}" to BOOL`);
+    }
+    default:
+      // STRING, TIMESTAMP, DATE, ZONED_DATETIME, etc. — pass through.
+      return value;
+  }
+}
+
 export function registerDataPlaneTools(server: McpServer) {
   // Conditional `id` arg: required under Ultipa Cloud only, optional when a Direct
   // instance is also configured, absent under Direct-only.
@@ -381,7 +464,7 @@ export function registerDataPlaneTools(server: McpServer) {
 
   server.tool(
     "import_data",
-    "**The right tool when the user attached / uploaded / pasted any file or row-shaped data.** Writes structured nodes and/or edges into a graph via the driver's gRPC bulk-insert path. **Do not hand-compose `INSERT` statements from file rows — use this instead.** **BEFORE calling, MUST stop and preview your plan to the user: node labels and edge labels, which column maps to `_id`, which columns map to `_from` / `_to` for edges (i.e. `fromNodeId` / `toNodeId`), which columns become which properties, the `mode` (normal / overwrite / upsert), and row counts. Wait for the user's 'go' or corrections. Bypasses GQL composition entirely: node and edge data go straight over gRPC, no statement to construct. **Format-agnostic at the wire**: parse the source on your side (CSV / JSON / JSONL / GraphML / pasted text / attached file) into the canonical `nodes` and `edges` arrays, then call this once. `mode` controls duplicate-`_id` semantics: `normal` (error on duplicate, default), `overwrite` (replace whole record), `upsert` (preserve existing properties, update supplied ones). Nodes are written BEFORE edges in a single call, so edges can reference newly-created nodes' `_id`s in the same batch.",
+    "**The right tool when the user attached / uploaded / pasted any file or row-shaped data.** Writes structured nodes and/or edges into a graph via the driver's gRPC bulk-insert path. **Do not hand-compose `INSERT` statements from file rows — use this instead.** **BEFORE calling, MUST stop and preview your plan to the user**: node labels and edge labels, which column maps to `_id`, which columns map to `_from` / `_to` for edges, which columns become which properties, the `mode` (`normal` / `overwrite` / `upsert`), and row counts. Wait for the user's 'go' or corrections. **Two input modes (mutually exclusive):** (1) **CSV pass-through** — strongly preferred when the user's file IS a CSV: pass the raw CSV string as `csv` + `csvLabel` + `csvIdColumn` (+ `csvFromColumn` / `csvToColumn` for edges). The MCP parses it server-side, which is dramatically faster than mode 2 because the agent emits the file verbatim instead of generating thousands of JSON objects. (2) **Canonical arrays** (`nodes` / `edges`) — for non-CSV formats (JSON / JSONL / GraphML / pasted text). Parse the source yourself into `{id, labels, properties}` (nodes) / `{id, label, fromNodeId, toNodeId, properties}` (edges). `mode` controls duplicate-`_id` semantics: `normal` (error on duplicate, default), `overwrite` (replace whole record), `upsert` (preserve existing properties, update supplied ones). Nodes are written BEFORE edges in a single call so edges can reference newly-created node `_id`s.",
     {
       ...idArg,
       ...graphArg,
@@ -435,6 +518,65 @@ export function registerDataPlaneTools(server: McpServer) {
         .describe(
           "Edges to insert. Written AFTER nodes in the same call, so edges may reference nodes inserted in this batch.",
         ),
+      csv: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "Raw CSV content WITH HEADER ROW. Mutually exclusive with `nodes` / `edges`. When set, requires `csvLabel`. For edges, also requires `csvFromColumn` + `csvToColumn`. Default delimiter is `,`; default quote char is `\"`. For exotic CSV (custom delimiter, leading metadata rows), preprocess on your side and use `nodes`/`edges` instead.",
+        ),
+      csvLabel: z
+        .string()
+        .regex(/^[A-Za-z_][A-Za-z0-9_]*$/)
+        .optional()
+        .describe(
+          "Required with `csv`. The node label (if importing nodes — `csvFromColumn`/`csvToColumn` not set) or the edge label (if importing edges — `csvFromColumn`/`csvToColumn` set). Single label only; for multi-label nodes use the `nodes` array form.",
+        ),
+      csvIdColumn: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "CSV column to use as `_id`. Omit to let GQLDB assign UUIDs. For edges, requires `EDGE_ID ENABLED` on the graph if set.",
+        ),
+      csvFromColumn: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "When importing edges from CSV: column with the source node's `_id`. Triggers edge-mode (must be paired with `csvToColumn`).",
+        ),
+      csvToColumn: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "When importing edges from CSV: column with the destination node's `_id`. Triggers edge-mode (must be paired with `csvFromColumn`).",
+        ),
+      csvProperties: z
+        .array(
+          z.object({
+            property: z
+              .string()
+              .regex(/^[A-Za-z_][A-Za-z0-9_]*$/)
+              .describe("Property name to write."),
+            column: z
+              .string()
+              .min(1)
+              .describe("CSV header column to read from."),
+            type: z
+              .string()
+              .regex(/^[A-Za-z][A-Za-z0-9_]*$/)
+              .optional()
+              .describe(
+                "Optional type coercion (`INT`, `FLOAT`, `BOOL`). Other types (`STRING`, `TIMESTAMP`, `DATE`, …) pass through as strings.",
+              ),
+          }),
+        )
+        .optional()
+        .describe(
+          "Per-property mapping. Omit to default every non-`_id` / `_from` / `_to` column to a same-named STRING property.",
+        ),
       mode: z
         .enum(["normal", "overwrite", "upsert"])
         .default("normal")
@@ -453,12 +595,26 @@ export function registerDataPlaneTools(server: McpServer) {
       graph?: string;
       nodes?: NodeData[];
       edges?: EdgeData[];
+      csv?: string;
+      csvLabel?: string;
+      csvIdColumn?: string;
+      csvFromColumn?: string;
+      csvToColumn?: string;
+      csvProperties?: Array<{ property: string; column: string; type?: string }>;
       mode: "normal" | "overwrite" | "upsert";
       skipInvalidEdges: boolean;
     }) => {
-      if (!args.nodes?.length && !args.edges?.length) {
+      // ── 1. Validate input mode ────────────────────────────────────────
+      const usingArrays = !!(args.nodes?.length || args.edges?.length);
+      const usingCsv = !!args.csv;
+      if (!usingArrays && !usingCsv) {
         throw new Error(
-          "import_data needs at least one of `nodes` / `edges` (non-empty array).",
+          "import_data needs either `nodes`/`edges` (canonical-arrays mode) or `csv` (CSV pass-through mode).",
+        );
+      }
+      if (usingArrays && usingCsv) {
+        throw new Error(
+          "import_data: `csv` is mutually exclusive with `nodes`/`edges`. Pick one input mode per call.",
         );
       }
       const graphName = args.graph ?? DEFAULT_GRAPH;
@@ -467,6 +623,109 @@ export function registerDataPlaneTools(server: McpServer) {
           "import_data needs a graph name. Pass the `graph` arg or set ULTIPA_GRAPH.",
         );
       }
+
+      // ── 2. Compute final nodes / edges arrays ─────────────────────────
+      let nodes: NodeData[] | undefined;
+      let edges: EdgeData[] | undefined;
+      let parsedFromCsv: { rows: number; label: string } | undefined;
+
+      if (usingArrays) {
+        nodes = args.nodes;
+        edges = args.edges;
+      } else {
+        if (!args.csvLabel) {
+          throw new Error(
+            "import_data CSV mode requires `csvLabel` (the node or edge label).",
+          );
+        }
+        if (!!args.csvFromColumn !== !!args.csvToColumn) {
+          throw new Error(
+            "import_data CSV edge mode requires BOTH `csvFromColumn` and `csvToColumn`.",
+          );
+        }
+        const isEdgeMode = !!args.csvFromColumn;
+        const rows = parseCsv(args.csv!);
+        if (rows.length < 1) {
+          throw new Error("CSV is empty (no header row).");
+        }
+        const header = rows[0];
+        const dataRows = rows
+          .slice(1)
+          .filter((r) => !(r.length === 1 && r[0] === ""));
+        const colIdx = (name: string): number => {
+          const i = header.indexOf(name);
+          if (i < 0)
+            throw new Error(
+              `CSV column "${name}" not found in header: ${header.join(", ")}`,
+            );
+          return i;
+        };
+        const idIdx = args.csvIdColumn ? colIdx(args.csvIdColumn) : -1;
+        const fromIdx = isEdgeMode ? colIdx(args.csvFromColumn!) : -1;
+        const toIdx = isEdgeMode ? colIdx(args.csvToColumn!) : -1;
+        const excluded = new Set(
+          [idIdx, fromIdx, toIdx].filter((i) => i >= 0),
+        );
+        const propMapping: Array<{
+          property: string;
+          colIdx: number;
+          type?: string;
+        }> = args.csvProperties
+          ? args.csvProperties.map((m) => ({
+              property: m.property,
+              colIdx: colIdx(m.column),
+              type: m.type,
+            }))
+          : header
+              .map((col, i) =>
+                excluded.has(i) ? null : { property: col, colIdx: i },
+              )
+              .filter(
+                (m): m is { property: string; colIdx: number } => m !== null,
+              );
+        const buildProps = (row: string[]): Record<string, any> => {
+          const props: Record<string, any> = {};
+          for (const m of propMapping) {
+            props[m.property] = coerceCell(row[m.colIdx] ?? "", m.type);
+          }
+          return props;
+        };
+        parsedFromCsv = { rows: dataRows.length, label: args.csvLabel };
+        if (isEdgeMode) {
+          edges = dataRows.map((row, i) => {
+            const fromNodeId = row[fromIdx];
+            const toNodeId = row[toIdx];
+            if (!fromNodeId || !toNodeId)
+              throw new Error(
+                `Row ${i + 2}: missing _from / _to (both required).`,
+              );
+            const edge: EdgeData = {
+              label: args.csvLabel!,
+              fromNodeId,
+              toNodeId,
+              properties: buildProps(row),
+            };
+            if (idIdx >= 0 && row[idIdx]) edge.id = row[idIdx];
+            return edge;
+          });
+        } else {
+          nodes = dataRows.map((row) => {
+            const node: NodeData = {
+              labels: [args.csvLabel!],
+              properties: buildProps(row),
+            };
+            if (idIdx >= 0 && row[idIdx]) node.id = row[idIdx];
+            return node;
+          });
+        }
+      }
+
+      // ── 3. Open a bulk-import session ─────────────────────────────────
+      // The driver's insertNodes/insertEdges (bulk gRPC path) require an
+      // active bulk-import session on the server side. Without
+      // `bulkImportSessionId`, the request fails with "insert without an
+      // active bulk-import session". The session is per-import: open before
+      // any insert, end after all inserts succeed, abort on failure.
       const target = resolveDataPlaneTarget(args.id);
       const client = await getDataPlaneClient(target);
       const insertType =
@@ -475,22 +734,51 @@ export function registerDataPlaneTools(server: McpServer) {
           : args.mode === "upsert"
             ? InsertType.Upsert
             : InsertType.Normal;
-      // Use the bulk-gRPC overload (string graphName first). Auto variants
-      // chunk large arrays internally so a single call survives big imports.
-      const out: Record<string, any> = { graph: graphName, mode: args.mode };
-      if (args.nodes?.length) {
-        out.nodes = await client.insertNodesBatchAuto(graphName, args.nodes, {
-          options: { mode: insertType },
-        });
+      const session = await client.startBulkImport(graphName, {
+        estimatedNodes: nodes?.length,
+        estimatedEdges: edges?.length,
+      });
+      if (!session.success) {
+        throw new Error(
+          `Failed to start bulk-import session on graph "${graphName}": ${session.message}`,
+        );
       }
-      if (args.edges?.length) {
-        out.edges = await client.insertEdgesBatchAuto(graphName, args.edges, {
-          options: {
-            mode: insertType,
-            skipInvalidNodes: args.skipInvalidEdges,
-          },
-        });
+
+      // ── 4. Insert under the session, then end (or abort on error) ────
+      const out: Record<string, any> = {
+        graph: graphName,
+        mode: args.mode,
+        sessionId: session.sessionId,
+      };
+      if (parsedFromCsv) out.parsedFromCsv = parsedFromCsv;
+      try {
+        if (nodes?.length) {
+          out.nodes = await client.insertNodesBatchAuto(graphName, nodes, {
+            options: { mode: insertType },
+            bulkImportSessionId: session.sessionId,
+          });
+        }
+        if (edges?.length) {
+          out.edges = await client.insertEdgesBatchAuto(graphName, edges, {
+            options: {
+              mode: insertType,
+              skipInvalidNodes: args.skipInvalidEdges,
+            },
+            bulkImportSessionId: session.sessionId,
+          });
+        }
+        const ended = await client.endBulkImport(session.sessionId);
+        out.endResult = {
+          totalRecords: ended.totalRecords,
+          message: ended.message,
+        };
+      } catch (e: any) {
+        await client.abortBulkImport(session.sessionId).catch(() => {});
+        throw new Error(
+          `Bulk-import session ${session.sessionId} aborted: ${e?.message ?? String(e)}`,
+        );
       }
+
       return json(out);
     },
   );

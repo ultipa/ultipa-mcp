@@ -180,7 +180,7 @@ Restart your client after editing.
 | `create_graph` | Create a new graph (OPEN / CLOSED / ONTOLOGY). |
 | `delete_graph` | Drop a graph. **Destructive — wipes all nodes, edges, indices.**  |
 | `write_data` | Run a GQL DML statement the agent composes by hand. For files on the user's machine, use `import_data` instead. |
-| `import_data` | Bulk-write structured nodes / edges via the driver's gRPC bulk-insert path. Bypasses GQL composition entirely. Format-agnostic — the agent parses any local source (CSV / JSON / JSONL / GraphML / pasted text) into canonical arrays and passes them in one call. |
+| `import_data` | Bulk-write structured nodes / edges via the driver's gRPC bulk-insert path. **Two input modes**: **CSV pass-through** (pass raw CSV as `csv` + `csvLabel` + column mappings — much faster on big CSVs since the agent emits the file verbatim instead of generating row JSON) or **canonical arrays** (`nodes` / `edges` for non-CSV formats: JSON, JSONL, GraphML, pasted text). |
 | `write_procedure` | Create a stored procedure. |
 | `get_db_version` | Live GQLDB version reported by the instance. |
 | `get_db_license` | GQLDB Edition + license info. |

@@ -195,9 +195,10 @@ export function registerDocsTools(server: McpServer) {
                 type: "text" as const,
                 text: JSON.stringify(
                   {
-                    error: `Failed to fetch '${topic}' (${res.status} ${res.statusText}). Slug may be wrong — try a different path, or one of the curated entry points below.`,
+                    error: `Failed to fetch '${topic}' (${res.status} ${res.statusText}). Slug is likely wrong. **Next step**: call \`lookup_docs({ topic: "?" })\` to get the full live index of every doc page in the repo, locate the actual path for what you wanted, then re-call \`lookup_docs\` with the correct slug. Do NOT guess another slug blindly — the index is the authoritative list. As a fallback, the curated entry points below may also be close to what you need.`,
                     fetchedUrl,
                     fallbackUrl,
+                    nextStep: 'Call lookup_docs({ topic: "?" }) to fetch the full index.',
                     curatedEntryPoints: TOPICS,
                   },
                   null,

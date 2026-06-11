@@ -19,6 +19,7 @@ import {
   hasModeA,
   hasModeB,
 } from "../helpers/env.js";
+import { readFile } from "node:fs/promises";
 
 // Minimal RFC 4180-style CSV parser used by `import_data`'s CSV pass-through.
 // Handles quoted fields with commas/newlines inside, escaped quotes (`""` → `"`),
@@ -101,6 +102,201 @@ function coerceCell(value: string, type?: string): any {
       // STRING, TIMESTAMP, DATE, ZONED_DATETIME, etc. — pass through.
       return value;
   }
+}
+
+// Convert parsed CSV content + companion fields into canonical NodeData[] /
+// EdgeData[]. Shared by inline `csv` content mode and `filePath` (CSV files).
+function csvToCanonical(
+  content: string,
+  opts: {
+    label: string;
+    idColumn?: string;
+    fromColumn?: string;
+    toColumn?: string;
+    properties?: Array<{ property: string; column: string; type?: string }>;
+  },
+): { nodes?: NodeData[]; edges?: EdgeData[]; rowCount: number } {
+  if (!!opts.fromColumn !== !!opts.toColumn) {
+    throw new Error(
+      "CSV edge mode requires BOTH `csvFromColumn` and `csvToColumn`.",
+    );
+  }
+  const isEdgeMode = !!opts.fromColumn;
+  const rows = parseCsv(content);
+  if (rows.length < 1) throw new Error("CSV is empty (no header row).");
+  const header = rows[0];
+  const dataRows = rows
+    .slice(1)
+    .filter((r) => !(r.length === 1 && r[0] === ""));
+  const colIdx = (name: string): number => {
+    const i = header.indexOf(name);
+    if (i < 0)
+      throw new Error(
+        `CSV column "${name}" not found in header: ${header.join(", ")}`,
+      );
+    return i;
+  };
+  const idIdx = opts.idColumn ? colIdx(opts.idColumn) : -1;
+  const fromIdx = isEdgeMode ? colIdx(opts.fromColumn!) : -1;
+  const toIdx = isEdgeMode ? colIdx(opts.toColumn!) : -1;
+  const excluded = new Set([idIdx, fromIdx, toIdx].filter((i) => i >= 0));
+  const propMapping: Array<{
+    property: string;
+    colIdx: number;
+    type?: string;
+  }> = opts.properties
+    ? opts.properties.map((m) => ({
+        property: m.property,
+        colIdx: colIdx(m.column),
+        type: m.type,
+      }))
+    : header
+        .map((col, i) =>
+          excluded.has(i) ? null : { property: col, colIdx: i },
+        )
+        .filter((m): m is { property: string; colIdx: number } => m !== null);
+  const buildProps = (row: string[]): Record<string, any> => {
+    const props: Record<string, any> = {};
+    for (const m of propMapping) {
+      props[m.property] = coerceCell(row[m.colIdx] ?? "", m.type);
+    }
+    return props;
+  };
+  if (isEdgeMode) {
+    const edges: EdgeData[] = dataRows.map((row, i) => {
+      const fromNodeId = row[fromIdx];
+      const toNodeId = row[toIdx];
+      if (!fromNodeId || !toNodeId)
+        throw new Error(`Row ${i + 2}: missing _from / _to (both required).`);
+      const edge: EdgeData = {
+        label: opts.label,
+        fromNodeId,
+        toNodeId,
+        properties: buildProps(row),
+      };
+      if (idIdx >= 0 && row[idIdx]) edge.id = row[idIdx];
+      return edge;
+    });
+    return { edges, rowCount: edges.length };
+  }
+  const nodes: NodeData[] = dataRows.map((row) => {
+    const node: NodeData = {
+      labels: [opts.label],
+      properties: buildProps(row),
+    };
+    if (idIdx >= 0 && row[idIdx]) node.id = row[idIdx];
+    return node;
+  });
+  return { nodes, rowCount: nodes.length };
+}
+
+// Convert JSON / JSONL content into canonical NodeData[] / EdgeData[].
+// Auto-detects shape: `NodeData[]` (labels array on first item), `EdgeData[]`
+// (fromNodeId/toNodeId on first item), or `{nodes, edges}` mixed object.
+function jsonToCanonical(
+  content: string,
+  isJsonl: boolean,
+): { nodes?: NodeData[]; edges?: EdgeData[] } {
+  let parsed: any;
+  if (isJsonl) {
+    parsed = content
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line !== "")
+      .map((line, i) => {
+        try {
+          return JSON.parse(line);
+        } catch (e: any) {
+          throw new Error(
+            `Invalid JSON on line ${i + 1}: ${e?.message ?? String(e)}`,
+          );
+        }
+      });
+  } else {
+    try {
+      parsed = JSON.parse(content);
+    } catch (e: any) {
+      throw new Error(`Invalid JSON: ${e?.message ?? String(e)}`);
+    }
+  }
+  if (Array.isArray(parsed)) {
+    if (parsed.length === 0) throw new Error("JSON array is empty.");
+    const first = parsed[0];
+    if (
+      first &&
+      typeof first === "object" &&
+      "fromNodeId" in first &&
+      "toNodeId" in first
+    ) {
+      return { edges: parsed as EdgeData[] };
+    }
+    if (first && typeof first === "object" && Array.isArray(first.labels)) {
+      return { nodes: parsed as NodeData[] };
+    }
+    throw new Error(
+      `Cannot detect JSON shape. Array items must be NodeData ({labels, properties, id?}) or EdgeData ({label, fromNodeId, toNodeId, properties, id?}). First item: ${JSON.stringify(first).slice(0, 200)}`,
+    );
+  }
+  if (parsed && typeof parsed === "object" && (parsed.nodes || parsed.edges)) {
+    return {
+      nodes: parsed.nodes as NodeData[] | undefined,
+      edges: parsed.edges as EdgeData[] | undefined,
+    };
+  }
+  throw new Error(
+    "JSON root must be NodeData[] / EdgeData[] / {nodes, edges}.",
+  );
+}
+
+// Dispatch a host file path to the right parser by extension. CSV requires
+// `csvLabel` + companion fields; JSON / JSONL parse straight into canonical
+// shape with no extra config.
+async function loadFilePath(
+  path: string,
+  csvOpts: {
+    label?: string;
+    idColumn?: string;
+    fromColumn?: string;
+    toColumn?: string;
+    properties?: Array<{ property: string; column: string; type?: string }>;
+  },
+): Promise<{
+  nodes?: NodeData[];
+  edges?: EdgeData[];
+  format: "csv" | "json" | "jsonl";
+  rowCount?: number;
+}> {
+  const ext = path.toLowerCase().split(".").pop();
+  let content: string;
+  try {
+    content = await readFile(path, "utf-8");
+  } catch (e: any) {
+    throw new Error(
+      `Cannot read file "${path}": ${e?.message ?? String(e)}. Path must be readable by the MCP process (typically the user's local machine for stdio MCPs).`,
+    );
+  }
+  if (ext === "csv") {
+    if (!csvOpts.label) {
+      throw new Error(
+        "CSV `filePath` requires `csvLabel` (the node or edge label).",
+      );
+    }
+    const { nodes, edges, rowCount } = csvToCanonical(content, {
+      label: csvOpts.label,
+      idColumn: csvOpts.idColumn,
+      fromColumn: csvOpts.fromColumn,
+      toColumn: csvOpts.toColumn,
+      properties: csvOpts.properties,
+    });
+    return { nodes, edges, format: "csv", rowCount };
+  }
+  if (ext === "json" || ext === "jsonl") {
+    const { nodes, edges } = jsonToCanonical(content, ext === "jsonl");
+    return { nodes, edges, format: ext as "json" | "jsonl" };
+  }
+  throw new Error(
+    `Unsupported file extension ".${ext}" for "${path}". Supported: .csv, .json, .jsonl`,
+  );
 }
 
 export function registerDataPlaneTools(server: McpServer) {
@@ -464,7 +660,7 @@ export function registerDataPlaneTools(server: McpServer) {
 
   server.tool(
     "import_data",
-    "**The right tool when the user attached / uploaded / pasted any file or row-shaped data.** Writes structured nodes and/or edges into a graph via the driver's gRPC bulk-insert path. **Do not hand-compose `INSERT` statements from file rows — use this instead.** **BEFORE calling, MUST stop and preview your plan to the user**: node labels and edge labels, which column maps to `_id`, which columns map to `_from` / `_to` for edges, which columns become which properties, the `mode` (`normal` / `overwrite` / `upsert`), and row counts. Wait for the user's 'go' or corrections. **Two input modes (mutually exclusive):** (1) **CSV pass-through** — strongly preferred when the user's file IS a CSV: pass the raw CSV string as `csv` + `csvLabel` + `csvIdColumn` (+ `csvFromColumn` / `csvToColumn` for edges). The MCP parses it server-side, which is dramatically faster than mode 2 because the agent emits the file verbatim instead of generating thousands of JSON objects. (2) **Canonical arrays** (`nodes` / `edges`) — for non-CSV formats (JSON / JSONL / GraphML / pasted text). Parse the source yourself into `{id, labels, properties}` (nodes) / `{id, label, fromNodeId, toNodeId, properties}` (edges). `mode` controls duplicate-`_id` semantics: `normal` (error on duplicate, default), `overwrite` (replace whole record), `upsert` (preserve existing properties, update supplied ones). Nodes are written BEFORE edges in a single call so edges can reference newly-created node `_id`s.",
+    "Use this when user uploaded/pasted any file or row-shaped data. Bulk-writes structured nodes/edges to a graph. Do NOT compose `INSERT` statements from file rows. Three import methods: (1) `filePath`. If user hasn't point you a filepath but only uploaded files to chat, STOP and HIGHLY RECOMMEND (actively, proactively) user to tell you where the files are stored so you can get `filePath`, and emphasize 'fast', 'save tokens' and 'no bacthing'. DO NOT fallback to other two methods. NOTE: once files uploaded to chat, you get paths in your agent sandbox, that path will FAIL. Keep asking user where the files are saved (most often on user's local machine). (2) `csv` (raw CSV string; subject to output cap, needs batching). (3) `nodes`/`edges` (canonical arrays; subject to output cap, needs batching). **For >2000 rows, push HARDER**: methods 2/3 are painfully slow, prone to truncation, and burn tokens. Only proceed with methods 2/3 if the user explicitly insists. **Before calling**: preview the plan (method, labels, `_id` / `_from` / `_to` columns, property mapping, `mode`, row counts) and wait for explicit user approval. **Batching**: per-response output cap ~8k tokens; if rows > ~500 (CSV) / ~150 (arrays), split into multiple calls. `filePath` has no such limit. **Retry safety**: before retrying after a failed/truncated import, run `run_gql_query` (`MATCH (n:<Label>) RETURN count(n)` etc.) to see what's already imported and resend only missing rows. `mode`: `normal` (error on duplicate `_id`, default), `overwrite` (replace), `upsert` (merge). Nodes written BEFORE edges so edges can reference fresh node `_id`s.",
     {
       ...idArg,
       ...graphArg,
@@ -518,40 +714,47 @@ export function registerDataPlaneTools(server: McpServer) {
         .describe(
           "Edges to insert. Written AFTER nodes in the same call, so edges may reference nodes inserted in this batch.",
         ),
+      filePath: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "Path to `.csv` / `.json` / `.jsonl` on the **MCP host's filesystem** (typically the user's machine for stdio MCPs) — NOT your agent sandbox. Sandbox paths like `/mnt/user-data/uploads/...` will fail with ENOENT. Use only paths the user explicitly gave you. Format detected by extension. CSV requires `csvLabel` + companion fields. JSON/JSONL must be canonical shape (`NodeData[]` / `EdgeData[]` / `{nodes, edges}`).",
+        ),
       csv: z
         .string()
         .min(1)
         .optional()
         .describe(
-          "Raw CSV content WITH HEADER ROW. Mutually exclusive with `nodes` / `edges`. When set, requires `csvLabel`. For edges, also requires `csvFromColumn` + `csvToColumn`. Default delimiter is `,`; default quote char is `\"`. For exotic CSV (custom delimiter, leading metadata rows), preprocess on your side and use `nodes`/`edges` instead.",
+          "Raw CSV with header row. Requires `csvLabel` (+ `csvFromColumn` / `csvToColumn` for edges). Default `,` delimiter, `\"` quote. For exotic CSV, preprocess and use `nodes` / `edges`.",
         ),
       csvLabel: z
         .string()
         .regex(/^[A-Za-z_][A-Za-z0-9_]*$/)
         .optional()
         .describe(
-          "Required with `csv`. The node label (if importing nodes — `csvFromColumn`/`csvToColumn` not set) or the edge label (if importing edges — `csvFromColumn`/`csvToColumn` set). Single label only; for multi-label nodes use the `nodes` array form.",
+          "Node label (when `csvFromColumn`/`csvToColumn` unset) or edge label (when both set). Single label only — for multi-label nodes use the `nodes` array form.",
         ),
       csvIdColumn: z
         .string()
         .min(1)
         .optional()
         .describe(
-          "CSV column to use as `_id`. Omit to let GQLDB assign UUIDs. For edges, requires `EDGE_ID ENABLED` on the graph if set.",
+          "CSV column to use as `_id`. Omit to let GQLDB assign UUIDs.",
         ),
       csvFromColumn: z
         .string()
         .min(1)
         .optional()
         .describe(
-          "When importing edges from CSV: column with the source node's `_id`. Triggers edge-mode (must be paired with `csvToColumn`).",
+          "Edge source `_id` column. Triggers edge mode (pair with `csvToColumn`).",
         ),
       csvToColumn: z
         .string()
         .min(1)
         .optional()
         .describe(
-          "When importing edges from CSV: column with the destination node's `_id`. Triggers edge-mode (must be paired with `csvFromColumn`).",
+          "Edge destination `_id` column. Triggers edge mode (pair with `csvFromColumn`).",
         ),
       csvProperties: z
         .array(
@@ -581,13 +784,13 @@ export function registerDataPlaneTools(server: McpServer) {
         .enum(["normal", "overwrite", "upsert"])
         .default("normal")
         .describe(
-          "Duplicate-`_id` semantics. `normal` errors on duplicate. `overwrite` replaces the whole record (unlisted properties dropped). `upsert` merges (existing properties preserved, supplied properties updated, labels unioned for nodes).",
+          "Duplicate-`_id` semantics. `normal` errors. `overwrite` replaces the whole record. `upsert` merges (preserves existing properties, updates supplied; unions labels for nodes).",
         ),
       skipInvalidEdges: z
         .boolean()
         .default(true)
         .describe(
-          "Edges only. When true, edges whose endpoint `_id` doesn't exist in the graph are skipped (counted in the result's `skippedCount`); when false, an invalid endpoint errors the whole edge batch.",
+          "Edges only. Skip edges whose endpoint `_id` is missing in the graph (counted in `skippedCount`). When `false`, an invalid endpoint errors the batch.",
         ),
     },
     async (args: {
@@ -596,6 +799,7 @@ export function registerDataPlaneTools(server: McpServer) {
       nodes?: NodeData[];
       edges?: EdgeData[];
       csv?: string;
+      filePath?: string;
       csvLabel?: string;
       csvIdColumn?: string;
       csvFromColumn?: string;
@@ -604,17 +808,21 @@ export function registerDataPlaneTools(server: McpServer) {
       mode: "normal" | "overwrite" | "upsert";
       skipInvalidEdges: boolean;
     }) => {
-      // ── 1. Validate input mode ────────────────────────────────────────
+      // ── 1. Validate import method ─────────────────────────────────────
       const usingArrays = !!(args.nodes?.length || args.edges?.length);
       const usingCsv = !!args.csv;
-      if (!usingArrays && !usingCsv) {
+      const usingFilePath = !!args.filePath;
+      const modesSet = [usingArrays, usingCsv, usingFilePath].filter(
+        Boolean,
+      ).length;
+      if (modesSet === 0) {
         throw new Error(
-          "import_data needs either `nodes`/`edges` (canonical-arrays mode) or `csv` (CSV pass-through mode).",
+          "import_data needs one of: `nodes`/`edges` (canonical arrays), `csv` (raw CSV content), or `filePath` (host path to a .csv, .json, or .jsonl file).",
         );
       }
-      if (usingArrays && usingCsv) {
+      if (modesSet > 1) {
         throw new Error(
-          "import_data: `csv` is mutually exclusive with `nodes`/`edges`. Pick one input mode per call.",
+          "import_data: `nodes`/`edges`, `csv`, and `filePath` are mutually exclusive — pick one import method per call.",
         );
       }
       const graphName = args.graph ?? DEFAULT_GRAPH;
@@ -627,97 +835,54 @@ export function registerDataPlaneTools(server: McpServer) {
       // ── 2. Compute final nodes / edges arrays ─────────────────────────
       let nodes: NodeData[] | undefined;
       let edges: EdgeData[] | undefined;
-      let parsedFromCsv: { rows: number; label: string } | undefined;
+      let parsedFrom:
+        | { source: string; format?: string; rows?: number; label?: string }
+        | undefined;
 
       if (usingArrays) {
         nodes = args.nodes;
         edges = args.edges;
+      } else if (usingFilePath) {
+        const loaded = await loadFilePath(args.filePath!, {
+          label: args.csvLabel,
+          idColumn: args.csvIdColumn,
+          fromColumn: args.csvFromColumn,
+          toColumn: args.csvToColumn,
+          properties: args.csvProperties,
+        });
+        nodes = loaded.nodes;
+        edges = loaded.edges;
+        parsedFrom = {
+          source: `filePath=${args.filePath}`,
+          format: loaded.format,
+          rows: loaded.rowCount,
+          label: args.csvLabel,
+        };
       } else {
+        // Inline CSV content
         if (!args.csvLabel) {
           throw new Error(
             "import_data CSV mode requires `csvLabel` (the node or edge label).",
           );
         }
-        if (!!args.csvFromColumn !== !!args.csvToColumn) {
-          throw new Error(
-            "import_data CSV edge mode requires BOTH `csvFromColumn` and `csvToColumn`.",
-          );
-        }
-        const isEdgeMode = !!args.csvFromColumn;
-        const rows = parseCsv(args.csv!);
-        if (rows.length < 1) {
-          throw new Error("CSV is empty (no header row).");
-        }
-        const header = rows[0];
-        const dataRows = rows
-          .slice(1)
-          .filter((r) => !(r.length === 1 && r[0] === ""));
-        const colIdx = (name: string): number => {
-          const i = header.indexOf(name);
-          if (i < 0)
-            throw new Error(
-              `CSV column "${name}" not found in header: ${header.join(", ")}`,
-            );
-          return i;
-        };
-        const idIdx = args.csvIdColumn ? colIdx(args.csvIdColumn) : -1;
-        const fromIdx = isEdgeMode ? colIdx(args.csvFromColumn!) : -1;
-        const toIdx = isEdgeMode ? colIdx(args.csvToColumn!) : -1;
-        const excluded = new Set(
-          [idIdx, fromIdx, toIdx].filter((i) => i >= 0),
+        const { nodes: csvNodes, edges: csvEdges, rowCount } = csvToCanonical(
+          args.csv!,
+          {
+            label: args.csvLabel,
+            idColumn: args.csvIdColumn,
+            fromColumn: args.csvFromColumn,
+            toColumn: args.csvToColumn,
+            properties: args.csvProperties,
+          },
         );
-        const propMapping: Array<{
-          property: string;
-          colIdx: number;
-          type?: string;
-        }> = args.csvProperties
-          ? args.csvProperties.map((m) => ({
-              property: m.property,
-              colIdx: colIdx(m.column),
-              type: m.type,
-            }))
-          : header
-              .map((col, i) =>
-                excluded.has(i) ? null : { property: col, colIdx: i },
-              )
-              .filter(
-                (m): m is { property: string; colIdx: number } => m !== null,
-              );
-        const buildProps = (row: string[]): Record<string, any> => {
-          const props: Record<string, any> = {};
-          for (const m of propMapping) {
-            props[m.property] = coerceCell(row[m.colIdx] ?? "", m.type);
-          }
-          return props;
+        nodes = csvNodes;
+        edges = csvEdges;
+        parsedFrom = {
+          source: "csv (inline content)",
+          format: "csv",
+          rows: rowCount,
+          label: args.csvLabel,
         };
-        parsedFromCsv = { rows: dataRows.length, label: args.csvLabel };
-        if (isEdgeMode) {
-          edges = dataRows.map((row, i) => {
-            const fromNodeId = row[fromIdx];
-            const toNodeId = row[toIdx];
-            if (!fromNodeId || !toNodeId)
-              throw new Error(
-                `Row ${i + 2}: missing _from / _to (both required).`,
-              );
-            const edge: EdgeData = {
-              label: args.csvLabel!,
-              fromNodeId,
-              toNodeId,
-              properties: buildProps(row),
-            };
-            if (idIdx >= 0 && row[idIdx]) edge.id = row[idIdx];
-            return edge;
-          });
-        } else {
-          nodes = dataRows.map((row) => {
-            const node: NodeData = {
-              labels: [args.csvLabel!],
-              properties: buildProps(row),
-            };
-            if (idIdx >= 0 && row[idIdx]) node.id = row[idIdx];
-            return node;
-          });
-        }
       }
 
       // ── 3. Open a bulk-import session ─────────────────────────────────
@@ -750,7 +915,7 @@ export function registerDataPlaneTools(server: McpServer) {
         mode: args.mode,
         sessionId: session.sessionId,
       };
-      if (parsedFromCsv) out.parsedFromCsv = parsedFromCsv;
+      if (parsedFrom) out.parsedFrom = parsedFrom;
       try {
         if (nodes?.length) {
           out.nodes = await client.insertNodesBatchAuto(graphName, nodes, {

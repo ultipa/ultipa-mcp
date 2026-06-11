@@ -96,7 +96,7 @@ export function registerInstanceTools(server: McpServer) {
 
   server.tool(
     "create_instance",
-    "Provision a new GQLDB instance. Blocks until the instance is fully provisioned and running (typically 30–60s). Returns the final instance object. The `adminPassword` is NOT included — call `get_instance_credentials` afterward to fetch it (the password is only generated during background provisioning, not at the moment the create call returns).",
+    "Provision a new GQLDB instance. Blocks until the instance is fully provisioned and running (typically 30–60s). Returns the final instance object with `adminUser` and `adminPassword` merged in. **The `POST /v1/instances` response is the ONE place the password is surfaced** — subsequent GETs strip it — so surface the password to the user immediately on return. No follow-up `get_instance_credentials` call is needed.",
     {
       name: z.string().min(1).max(30).describe("Instance name (1–30 chars)"),
       region: z
@@ -109,17 +109,21 @@ export function registerInstanceTools(server: McpServer) {
     async ({ name, region, sizeId }, extra) => {
       const onProgress = makeProgressReporter(extra);
       await onProgress?.("Submitting create request...", undefined);
+      // POST /v1/instances is the only place adminPassword is surfaced — capture
+      // it now and merge into the final return after waitForSettled (which polls
+      // GET /v1/instances/:id, and GET strips the password).
       const created = (await api("/v1/instances", {
         method: "POST",
         body: { name, region, sizeId },
-      })) as { _id: string };
+      })) as { _id: string; adminPassword?: string };
       try {
-        return json(
-          await waitForSettled(created._id, "running", { onProgress }),
-        );
+        const settled = await waitForSettled(created._id, "running", {
+          onProgress,
+        });
+        return json({ ...settled, adminPassword: created.adminPassword });
       } catch (e: any) {
         throw new Error(
-          `Instance ${created._id} WAS created but waiting for "running" failed: ${e?.message ?? e}. Do NOT call create_instance again — that would provision a duplicate. Call wait_for_instance_status(id="${created._id}") to keep waiting, or get_instance(id="${created._id}") to check the current state.`,
+          `Instance ${created._id} WAS created but waiting for "running" failed: ${e?.message ?? e}. Do NOT call create_instance again — that would provision a duplicate. Initial adminPassword from the create response: "${created.adminPassword ?? "<not in response>"}" — surface it to the user before retrying anything. Call wait_for_instance_status(id="${created._id}") to keep waiting, or get_instance(id="${created._id}") to check the current state.`,
         );
       }
     },

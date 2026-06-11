@@ -256,7 +256,7 @@ export function registerDataPlaneTools(server: McpServer) {
       mode: z
         .enum(["open", "closed", "ontology"])
         .default("open")
-        .describe("'open' for schema-free; 'closed' for schema-enforced (requires one of typedName / likeGraph / inlineDefinition); 'ontology' for RDF / OWL-style semantic graphs (no extra args)."),
+        .describe("'open' for schema-free; 'closed' for schema-enforced (requires one of typedName / likeGraph / inlineDefinition); 'ontology' for RDF / OWL-style semantic graphs."),
       typedName: z
         .string()
         .regex(/^[a-zA-Z_][a-zA-Z0-9_]*$/)
@@ -357,14 +357,14 @@ export function registerDataPlaneTools(server: McpServer) {
 
   server.tool(
     "write_data",
-    "Use this for GQL statements you compose yourself. **If the user attached / uploaded / pasted any file or row-shaped data, use `import_data` instead — do NOT hand-compose `INSERT` statements from file content; that's `import_data`'s job.** This tool runs `INSERT` / `INSERT OVERWRITE` (overwrite by `_id`) / `UPSERT` (insert-or-update by `_id`) / `MERGE` (match-or-create by pattern) / `FOREACH` (iterate a list and write) / `LOAD CSV` (only when the CSV is already on the GQLDB server's filesystem, NOT the user's machine). Call `lookup_docs('gql/pages/data-manipulation/<statement>')` first if unsure of syntax (slugs: `insert`, `insert-overwrite`, `upsert`, `merge`, `foreach`, `load-csv`). For node/edge `_id` semantics (custom vs system-generated IDs), call `lookup_docs('gql/pages/data-manipulation/node-and-edge-ids')`.",
+    "If the GQL you are about to send contains `INSERT` statements built from rows in a file/CSV/JSON the user shared, you are using the WRONG tool — call `import_data` instead. This rule applies regardless of how natural composing INSERT statements feels; file-derived bulk writes MUST go through `import_data`. Continue here only if user wrote out a small literal record in-conversation.",
     {
       ...idArg,
       gql: z
         .string()
         .min(1)
         .describe(
-          "The GQL write statement (INSERT / INSERT OVERWRITE / UPSERT / MERGE / FOREACH / LOAD CSV).",
+          "The GQL write statement (INSERT / INSERT OVERWRITE / UPSERT / MERGE / FOREACH). Call `lookup_docs('gql/pages/data-manipulation/<statement>')` first if unsure of syntax (slugs: `insert`, `insert-overwrite`, `upsert`, `merge`, `foreach`). For node/edge `_id` semantics, call `lookup_docs('gql/pages/data-manipulation/node-and-edge-ids')`.",
         ),
       ...graphArg,
     },
@@ -381,7 +381,7 @@ export function registerDataPlaneTools(server: McpServer) {
 
   server.tool(
     "import_data",
-    "**The right tool when the user attached / uploaded / pasted any file or row-shaped data.** Writes structured nodes and/or edges into a graph via the driver's gRPC bulk-insert path. **Do not hand-compose `INSERT` statements from file rows — use this instead.** **BEFORE calling, preview your plan to the user** in a short block: node labels and edge labels, which column maps to `_id`, which columns map to `_from` / `_to` for edges (i.e. `fromNodeId` / `toNodeId`), which columns become which properties, the `mode`, and approximate row counts. Wait for the user's 'go' or corrections. Skip the preview only if the user already specified every mapping explicitly in this turn. Bypasses GQL composition entirely: node and edge data go straight over gRPC, no statement to construct or quote. **Format-agnostic at the wire**: parse the source on your side (CSV / JSON / JSONL / GraphML / pasted text / attached file) into the canonical `nodes` and `edges` arrays, then call this once. For CSVs already on the GQLDB server, `LOAD CSV` via `write_data` is one round trip on the server side and may be faster. For very large imports (millions of rows, live SQL databases, other graph platforms, big-data systems), use Ultipa Manager → Data Integration or Transporter. `mode` controls duplicate-`_id` semantics: `normal` (error on duplicate, default), `overwrite` (replace whole record), `upsert` (merge — preserve existing properties, update supplied ones). Nodes are written BEFORE edges in a single call, so edges can reference newly-created nodes' `_id`s in the same batch. Closed/ontology-graph payloads must conform to the schema/ontology.",
+    "**The right tool when the user attached / uploaded / pasted any file or row-shaped data.** Writes structured nodes and/or edges into a graph via the driver's gRPC bulk-insert path. **Do not hand-compose `INSERT` statements from file rows — use this instead.** **BEFORE calling, MUST stop and preview your plan to the user: node labels and edge labels, which column maps to `_id`, which columns map to `_from` / `_to` for edges (i.e. `fromNodeId` / `toNodeId`), which columns become which properties, the `mode` (normal / overwrite / upsert), and row counts. Wait for the user's 'go' or corrections. Bypasses GQL composition entirely: node and edge data go straight over gRPC, no statement to construct. **Format-agnostic at the wire**: parse the source on your side (CSV / JSON / JSONL / GraphML / pasted text / attached file) into the canonical `nodes` and `edges` arrays, then call this once. `mode` controls duplicate-`_id` semantics: `normal` (error on duplicate, default), `overwrite` (replace whole record), `upsert` (preserve existing properties, update supplied ones). Nodes are written BEFORE edges in a single call, so edges can reference newly-created nodes' `_id`s in the same batch.",
     {
       ...idArg,
       ...graphArg,

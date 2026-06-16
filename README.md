@@ -25,32 +25,57 @@ Need both, or multiple direct instances? Add more entries (see [Multiple targets
 
 ## Install
 
-### One target via install-mcp
+Add an entry under `mcpServers` in your MCP client's config. The same JSON shape works in any stdio MCP client; only the file path differs:
 
-Replace `claude` with your client: `cursor`, `windsurf`, `vscode`, `cline`, etc.
+| Client | Config file |
+|---|---|
+| Claude Desktop | `claude_desktop_config.json` (Settings → Developer → Edit Config) |
+| Cursor | `~/.cursor/mcp.json` |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` |
+| VS Code MCP extensions | extension-specific (see the extension's docs) |
+
+### One target
 
 For an Ultipa Cloud account:
 
-```bash
-npx -y install-mcp@latest ultipa-mcp --client claude \
-  --env ULTIPA_CLOUD_API_KEY=uc_...
+```json
+{
+  "mcpServers": {
+    "ultipa-cloud": {
+      "command": "npx",
+      "args": ["-y", "ultipa-mcp"],
+      "env": {
+        "ULTIPA_CLOUD_API_KEY": "uc_..."
+      }
+    }
+  }
+}
 ```
 
 For a direct instance:
 
-```bash
-npx -y install-mcp@latest ultipa-mcp --client claude \
-  --env ULTIPA_HOST=<host>:<port> \
-  --env ULTIPA_USERNAME=admin \
-  --env ULTIPA_PASSWORD=<password> \
-  --env ULTIPA_GRAPH=default
+```json
+{
+  "mcpServers": {
+    "ultipa-direct": {
+      "command": "npx",
+      "args": ["-y", "ultipa-mcp"],
+      "env": {
+        "ULTIPA_HOST": "<host>:<port>",
+        "ULTIPA_USERNAME": "admin",
+        "ULTIPA_PASSWORD": "<password>",
+        "ULTIPA_GRAPH": "default"
+      }
+    }
+  }
+}
 ```
+
+Restart your client after editing.
 
 ### Multiple targets
 
-Each MCP server entry in your client's config points at one Ultipa target. Add as many entries as you need, with descriptive names. Claude (or any agent) sees each entry as its own toolset and picks based on what you ask (e.g. "query staging" routes to the `ultipa-staging` entry).
-
-The same JSON shape works in any stdio MCP client; only the file path differs (Claude Desktop: `claude_desktop_config.json` via Settings → Developer → Edit Config; Cursor: `~/.cursor/mcp.json`; Windsurf, VS Code MCP extensions: see their docs).
+Each MCP server entry points at one Ultipa target. Add as many entries as you need, with descriptive names. Claude (or any agent) sees each entry as its own toolset and picks based on what you ask (e.g. "query staging" routes to the `ultipa-staging` entry).
 
 ```json
 {

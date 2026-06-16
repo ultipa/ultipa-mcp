@@ -89,9 +89,7 @@ export async function waitForBackup(
   const deadline = Date.now() + timeoutMs;
   let backup: any = null;
   while (Date.now() < deadline) {
-    const backups = (await api(
-      `/v1/instances/${instanceId}/backups`,
-    )) as any[];
+    const backups = (await api(`/v1/instances/${instanceId}/backups`)) as any[];
     backup = backups.find((b) => b?._id === backupId);
     if (!backup) {
       throw new Error(

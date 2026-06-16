@@ -14,3 +14,11 @@ export const DEFAULT_GRAPH = process.env.ULTIPA_GRAPH;
 
 export const hasModeA = !!API_KEY;
 export const hasModeB = !!(INSTANCE_HOST && INSTANCE_USER && INSTANCE_PASSWORD);
+
+// Debug logging — when ULTIPA_MCP_DEBUG is truthy ("1", "true", etc.), every
+// tool call's name + latency + error (if any) goes to stderr. Useful for
+// agent-trace debugging without slowing down normal operation.
+export const DEBUG = (() => {
+  const v = process.env.ULTIPA_MCP_DEBUG?.toLowerCase().trim();
+  return v === "1" || v === "true" || v === "yes" || v === "on";
+})();

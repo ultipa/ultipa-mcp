@@ -54,7 +54,13 @@ async function buildDataPlaneClient(target: string): Promise<GqldbClient> {
     .timeoutSeconds(120)
     .build();
   const client = new GqldbClient(cfg);
-  await client.login(user, password);
+  try {
+    await client.login(user, password);
+  } catch (e) {
+    // Don't leak an un-logged-in client — gRPC channel + driver state.
+    await client.close().catch(() => {});
+    throw e;
+  }
   return client;
 }
 

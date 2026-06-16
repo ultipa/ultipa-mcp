@@ -203,23 +203,20 @@ Works with either Ultipa Cloud or a Direct instance.
 |---|---|
 | `lookup_docs` | Fetch Ultipa documentation pages by topic. Useful for the agent to ground GQLDB features and GQL composition in authoritative reference. |
 
-## Local development
+## Troubleshooting
 
-```bash
-npm install
-npm run dev      # tsx watch
-```
+| Symptom | Likely cause / fix |
+|---|---|
+| `ENOENT: no such file or directory` from `import_data` with `filePath` | The path is on your agent's sandbox, not the MCP host. Drag the file into your terminal to copy its real host path, or paste the file content via `csv` mode. |
+| Edge insert rejected with "EDGE_ID disabled" or custom `_id` not allowed | The graph has edge `_id` disabled. Run `ALTER GRAPH <name> SET EDGE_ID ENABLED` via `run_gql_query`, or drop the `_id` from your edge data. |
+| `instances:credentials` permission required (data plane fails on a Cloud target) | Your `ULTIPA_CLOUD_API_KEY` doesn't have `instances:credentials`. Regenerate the key with that scope at https://dbaas.ultipa.com → Settings → API Keys. |
+| `list_instances` shows nothing even though you have an instance | You're targeting a Direct instance (env vars only), not a Cloud account. `list_instances` only sees Cloud instances. Call `test_connection` (omit `id`) to confirm the Direct instance is reachable. |
+| `create_instance` succeeded but `adminPassword` is missing in the response | The Cloud REST `POST /v1/instances` returns the password exactly once. If you missed it, call `get_instance_credentials` (requires the `instances:credentials` scope). |
+| MCP launches but exits immediately with "needs at least one auth mode" | None of `ULTIPA_CLOUD_API_KEY` or the Direct trio (`ULTIPA_HOST` + `ULTIPA_USERNAME` + `ULTIPA_PASSWORD`) are set. Add them to your MCP client's `env` block. |
+| MCP launches but exits with "Direct instance config is incomplete" | You set one or two of the Direct env vars; all three (`ULTIPA_HOST`, `ULTIPA_USERNAME`, `ULTIPA_PASSWORD`) are required together. |
+| `import_data` very slow / truncated in `csv` or arrays mode | The agent's output rate is the bottleneck. Provide a host file path so the MCP uses `filePath` mode (constant tokens), or fall back to Ultipa Manager → Data Integration for very large imports. |
 
-To point your local MCP client at the dev build, replace `command` / `args` in the JSON above with:
-
-```json
-"command": "/absolute/path/to/ultipa-mcp/node_modules/.bin/tsx",
-"args": ["/absolute/path/to/ultipa-mcp/src/index.ts"]
-```
-
-Both paths must be absolute. MCP clients launch the server from `/`, not your project directory.
-
-To check types: `npx tsc --noEmit`. To produce a publishable build: `npm run build` (outputs to `dist/`).
+For agent-side trace debugging, set `ULTIPA_MCP_DEBUG=1` in the MCP env to log every tool call name + latency to stderr.
 
 ## License
 

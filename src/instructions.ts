@@ -13,7 +13,7 @@ export const SERVER_INSTRUCTIONS = [
   "If `get_instance_credentials` fails on permissions, the recovery options are: (1) copy the password from https://dbaas.ultipa.com → Instance Details page, (2) regenerate the API key with the `instances:credentials` permission from https://dbaas.ultipa.com → Settings → API Keys, or (3) only when the user explicitly asks to rotate the password, call `reset_admin_password`.",
   "",
   "**2. Graph Query and Analytics**",
-  "**Use `lookup_docs` aggressively.** Training-time knowledge of Ultipa GQLDB or GQL is often wrong on edges. For any Ultipa or GQL specific question — schema design, GQL syntax, function signatures, ontology features, algorithm catalog — call `lookup_docs` FIRST and use the returned markdown as ground truth instead of guessing. The tool's description and empty-call response list the curated entry points; call `lookup_docs({ topic: \"?\" })` for the full live index.",
+  '**Use `lookup_docs` aggressively.** Training-time knowledge of Ultipa GQLDB or GQL is often wrong on edges. For any Ultipa or GQL specific question — schema design, GQL syntax, function signatures, ontology features, algorithm catalog — call `lookup_docs` FIRST and use the returned markdown as ground truth instead of guessing. The tool\'s description and empty-call response list the curated entry points; call `lookup_docs({ topic: "?" })` for the full live index.',
   "",
   "The query language is **GQL** (ISO/IEC 39075 standard Graph Query Language). It is NOT UQL, Cypher, or GraphQL.",
   "",

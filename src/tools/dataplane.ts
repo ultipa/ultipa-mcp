@@ -19,285 +19,7 @@ import {
   hasModeA,
   hasModeB,
 } from "../helpers/env.js";
-import { readFile } from "node:fs/promises";
-
-// Minimal RFC 4180-style CSV parser used by `import_data`'s CSV pass-through.
-// Handles quoted fields with commas/newlines inside, escaped quotes (`""` → `"`),
-// CRLF / LF line endings, UTF-8 BOM, and a missing trailing newline. Default
-// delimiter is `,`. For non-standard CSVs (custom delimiter, leading metadata
-// rows, exotic quoting), the agent should preprocess client-side and use the
-// canonical `nodes`/`edges` arrays instead.
-function parseCsv(text: string): string[][] {
-  if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
-  const rows: string[][] = [];
-  let row: string[] = [];
-  let field = "";
-  let inQuotes = false;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (inQuotes) {
-      if (c === '"') {
-        if (text[i + 1] === '"') {
-          field += '"';
-          i++;
-        } else {
-          inQuotes = false;
-        }
-      } else {
-        field += c;
-      }
-    } else if (c === '"') {
-      inQuotes = true;
-    } else if (c === ",") {
-      row.push(field);
-      field = "";
-    } else if (c === "\n") {
-      row.push(field);
-      rows.push(row);
-      row = [];
-      field = "";
-    } else if (c === "\r") {
-      // ignore; `\n` handles row break
-    } else {
-      field += c;
-    }
-  }
-  if (field !== "" || row.length > 0) {
-    row.push(field);
-    rows.push(row);
-  }
-  return rows;
-}
-
-// Coerce a raw CSV cell (always a string) into the requested type. Empty cells
-// become null. Unknown / passthrough types return the original string so the
-// server can do its own coercion if applicable.
-function coerceCell(value: string, type?: string): any {
-  if (value === "") return null;
-  if (!type) return value;
-  switch (type.toUpperCase()) {
-    case "INT":
-    case "INTEGER":
-    case "BIGINT": {
-      const n = parseInt(value, 10);
-      if (Number.isNaN(n))
-        throw new Error(`Cannot coerce "${value}" to INT`);
-      return n;
-    }
-    case "FLOAT":
-    case "DOUBLE": {
-      const f = parseFloat(value);
-      if (Number.isNaN(f))
-        throw new Error(`Cannot coerce "${value}" to FLOAT`);
-      return f;
-    }
-    case "BOOL":
-    case "BOOLEAN": {
-      const v = value.trim().toLowerCase();
-      if (["true", "t", "yes", "y", "1"].includes(v)) return true;
-      if (["false", "f", "no", "n", "0"].includes(v)) return false;
-      throw new Error(`Cannot coerce "${value}" to BOOL`);
-    }
-    default:
-      // STRING, TIMESTAMP, DATE, ZONED_DATETIME, etc. — pass through.
-      return value;
-  }
-}
-
-// Convert parsed CSV content + companion fields into canonical NodeData[] /
-// EdgeData[]. Shared by inline `csv` content mode and `filePath` (CSV files).
-function csvToCanonical(
-  content: string,
-  opts: {
-    label: string;
-    idColumn?: string;
-    fromColumn?: string;
-    toColumn?: string;
-    properties?: Array<{ property: string; column: string; type?: string }>;
-  },
-): { nodes?: NodeData[]; edges?: EdgeData[]; rowCount: number } {
-  if (!!opts.fromColumn !== !!opts.toColumn) {
-    throw new Error(
-      "CSV edge mode requires BOTH `csvFromColumn` and `csvToColumn`.",
-    );
-  }
-  const isEdgeMode = !!opts.fromColumn;
-  const rows = parseCsv(content);
-  if (rows.length < 1) throw new Error("CSV is empty (no header row).");
-  const header = rows[0];
-  const dataRows = rows
-    .slice(1)
-    .filter((r) => !(r.length === 1 && r[0] === ""));
-  const colIdx = (name: string): number => {
-    const i = header.indexOf(name);
-    if (i < 0)
-      throw new Error(
-        `CSV column "${name}" not found in header: ${header.join(", ")}`,
-      );
-    return i;
-  };
-  const idIdx = opts.idColumn ? colIdx(opts.idColumn) : -1;
-  const fromIdx = isEdgeMode ? colIdx(opts.fromColumn!) : -1;
-  const toIdx = isEdgeMode ? colIdx(opts.toColumn!) : -1;
-  const excluded = new Set([idIdx, fromIdx, toIdx].filter((i) => i >= 0));
-  const propMapping: Array<{
-    property: string;
-    colIdx: number;
-    type?: string;
-  }> = opts.properties
-    ? opts.properties.map((m) => ({
-        property: m.property,
-        colIdx: colIdx(m.column),
-        type: m.type,
-      }))
-    : header
-        .map((col, i) =>
-          excluded.has(i) ? null : { property: col, colIdx: i },
-        )
-        .filter((m): m is { property: string; colIdx: number } => m !== null);
-  const buildProps = (row: string[]): Record<string, any> => {
-    const props: Record<string, any> = {};
-    for (const m of propMapping) {
-      props[m.property] = coerceCell(row[m.colIdx] ?? "", m.type);
-    }
-    return props;
-  };
-  if (isEdgeMode) {
-    const edges: EdgeData[] = dataRows.map((row, i) => {
-      const fromNodeId = row[fromIdx];
-      const toNodeId = row[toIdx];
-      if (!fromNodeId || !toNodeId)
-        throw new Error(`Row ${i + 2}: missing _from / _to (both required).`);
-      const edge: EdgeData = {
-        label: opts.label,
-        fromNodeId,
-        toNodeId,
-        properties: buildProps(row),
-      };
-      if (idIdx >= 0 && row[idIdx]) edge.id = row[idIdx];
-      return edge;
-    });
-    return { edges, rowCount: edges.length };
-  }
-  const nodes: NodeData[] = dataRows.map((row) => {
-    const node: NodeData = {
-      labels: [opts.label],
-      properties: buildProps(row),
-    };
-    if (idIdx >= 0 && row[idIdx]) node.id = row[idIdx];
-    return node;
-  });
-  return { nodes, rowCount: nodes.length };
-}
-
-// Convert JSON / JSONL content into canonical NodeData[] / EdgeData[].
-// Auto-detects shape: `NodeData[]` (labels array on first item), `EdgeData[]`
-// (fromNodeId/toNodeId on first item), or `{nodes, edges}` mixed object.
-function jsonToCanonical(
-  content: string,
-  isJsonl: boolean,
-): { nodes?: NodeData[]; edges?: EdgeData[] } {
-  let parsed: any;
-  if (isJsonl) {
-    parsed = content
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line !== "")
-      .map((line, i) => {
-        try {
-          return JSON.parse(line);
-        } catch (e: any) {
-          throw new Error(
-            `Invalid JSON on line ${i + 1}: ${e?.message ?? String(e)}`,
-          );
-        }
-      });
-  } else {
-    try {
-      parsed = JSON.parse(content);
-    } catch (e: any) {
-      throw new Error(`Invalid JSON: ${e?.message ?? String(e)}`);
-    }
-  }
-  if (Array.isArray(parsed)) {
-    if (parsed.length === 0) throw new Error("JSON array is empty.");
-    const first = parsed[0];
-    if (
-      first &&
-      typeof first === "object" &&
-      "fromNodeId" in first &&
-      "toNodeId" in first
-    ) {
-      return { edges: parsed as EdgeData[] };
-    }
-    if (first && typeof first === "object" && Array.isArray(first.labels)) {
-      return { nodes: parsed as NodeData[] };
-    }
-    throw new Error(
-      `Cannot detect JSON shape. Array items must be NodeData ({labels, properties, id?}) or EdgeData ({label, fromNodeId, toNodeId, properties, id?}). First item: ${JSON.stringify(first).slice(0, 200)}`,
-    );
-  }
-  if (parsed && typeof parsed === "object" && (parsed.nodes || parsed.edges)) {
-    return {
-      nodes: parsed.nodes as NodeData[] | undefined,
-      edges: parsed.edges as EdgeData[] | undefined,
-    };
-  }
-  throw new Error(
-    "JSON root must be NodeData[] / EdgeData[] / {nodes, edges}.",
-  );
-}
-
-// Dispatch a host file path to the right parser by extension. CSV requires
-// `csvLabel` + companion fields; JSON / JSONL parse straight into canonical
-// shape with no extra config.
-async function loadFilePath(
-  path: string,
-  csvOpts: {
-    label?: string;
-    idColumn?: string;
-    fromColumn?: string;
-    toColumn?: string;
-    properties?: Array<{ property: string; column: string; type?: string }>;
-  },
-): Promise<{
-  nodes?: NodeData[];
-  edges?: EdgeData[];
-  format: "csv" | "json" | "jsonl";
-  rowCount?: number;
-}> {
-  const ext = path.toLowerCase().split(".").pop();
-  let content: string;
-  try {
-    content = await readFile(path, "utf-8");
-  } catch (e: any) {
-    throw new Error(
-      `Cannot read file "${path}": ${e?.message ?? String(e)}. Path must be readable by the MCP process (typically the user's local machine for stdio MCPs).`,
-    );
-  }
-  if (ext === "csv") {
-    if (!csvOpts.label) {
-      throw new Error(
-        "CSV `filePath` requires `csvLabel` (the node or edge label).",
-      );
-    }
-    const { nodes, edges, rowCount } = csvToCanonical(content, {
-      label: csvOpts.label,
-      idColumn: csvOpts.idColumn,
-      fromColumn: csvOpts.fromColumn,
-      toColumn: csvOpts.toColumn,
-      properties: csvOpts.properties,
-    });
-    return { nodes, edges, format: "csv", rowCount };
-  }
-  if (ext === "json" || ext === "jsonl") {
-    const { nodes, edges } = jsonToCanonical(content, ext === "jsonl");
-    return { nodes, edges, format: ext as "json" | "jsonl" };
-  }
-  throw new Error(
-    `Unsupported file extension ".${ext}" for "${path}". Supported: .csv, .json, .jsonl`,
-  );
-}
+import { csvToCanonical, loadFilePath } from "../helpers/import.js";
 
 export function registerDataPlaneTools(server: McpServer) {
   // Conditional `id` arg: required under Ultipa Cloud only, optional when a Direct
@@ -326,7 +48,7 @@ export function registerDataPlaneTools(server: McpServer) {
 
   server.tool(
     "test_connection",
-    "Quick health check on the target GQLDB instance — call this when the user asks 'can you see/connect my instance' / 'is my GQLDB reachable'. Resolves the target (Mode A: fetches creds via Cloud; Mode B: uses env vars), opens or reuses a gRPC connection, logs in, and runs `healthCheck()`. Returns `{ ok, target, status, latencyMs, error? }`. Much faster than running a real query — use this as the first probe.",
+    "Quick health check on the target GQLDB instance — call this when the user asks 'can you see/connect my instance' / 'is my GQLDB reachable'. Verifies connectivity and login and returns `{ ok, target, status, latencyMs, error? }`. Much faster than running a real query — use this as the first probe.",
     { ...idArg },
     async (args: { id?: string }) => {
       const start = Date.now();
@@ -363,7 +85,7 @@ export function registerDataPlaneTools(server: McpServer) {
 
   server.tool(
     "run_gql_query",
-    "Execute a literal GQL query against a GQLDB instance and return the result rows. Reuses an open gRPC connection per instance (lazy-init on first call, closed on server shutdown). For Mode A targets, fetches credentials via `get_instance_credentials` on first connect — that API key needs the `instances:credentials` scope. Call `lookup_docs` for the relevant topic first if uncertain about Ultipa-specific GQL syntax — training data is patchy on edges.",
+    "Execute a literal GQL query against a GQLDB instance and return the result rows. For Ultipa Cloud targets, the API key needs the `instances:credentials` scope (used to fetch the instance's admin password). Call `lookup_docs` for the relevant topic first if uncertain about Ultipa-specific GQL syntax — training data is patchy on edges.",
     {
       ...idArg,
       query: z.string().min(1).describe("The GQL query to run"),
@@ -478,7 +200,11 @@ export function registerDataPlaneTools(server: McpServer) {
       const overviewPromise = safe("RETURN db.overview()");
 
       // Step 3: branch on mode and run the mode-appropriate introspection.
-      const out: Record<string, any> = { graph: graphName, mode, describeGraph };
+      const out: Record<string, any> = {
+        graph: graphName,
+        mode,
+        describeGraph,
+      };
 
       if (mode === "CLOSED") {
         const [overview, nodeTypes, edgeTypes, stats] = await Promise.all([
@@ -495,25 +221,27 @@ export function registerDataPlaneTools(server: McpServer) {
         ]);
         Object.assign(out, { overview, stats });
       } else if (mode === "ONTOLOGY") {
-        const [overview, ontology, prefix, classes, properties] = await Promise.all([
-          overviewPromise,
-          safe("SHOW ONTOLOGY"),
-          safe("SHOW PREFIX"),
-          safe("SHOW CLASSES"),
-          safe("SHOW PROPERTIES"),
-        ]);
+        const [overview, ontology, prefix, classes, properties] =
+          await Promise.all([
+            overviewPromise,
+            safe("SHOW ONTOLOGY"),
+            safe("SHOW PREFIX"),
+            safe("SHOW CLASSES"),
+            safe("SHOW PROPERTIES"),
+          ]);
         Object.assign(out, { overview, ontology, prefix, classes, properties });
       } else {
         // Couldn't extract graph_mode — fall back to running everything safely.
         out.note =
           "graph_mode not found in DESC GRAPH output; running generic introspection.";
-        const [overview, nodeTypes, edgeTypes, labels, stats] = await Promise.all([
-          overviewPromise,
-          safe("SHOW NODE TYPES"),
-          safe("SHOW EDGE TYPES"),
-          safe("SHOW LABELS"),
-          safe("RETURN db.stats()"),
-        ]);
+        const [overview, nodeTypes, edgeTypes, labels, stats] =
+          await Promise.all([
+            overviewPromise,
+            safe("SHOW NODE TYPES"),
+            safe("SHOW EDGE TYPES"),
+            safe("SHOW LABELS"),
+            safe("RETURN db.stats()"),
+          ]);
         Object.assign(out, { overview, nodeTypes, edgeTypes, labels, stats });
       }
 
@@ -535,21 +263,29 @@ export function registerDataPlaneTools(server: McpServer) {
       mode: z
         .enum(["open", "closed", "ontology"])
         .default("open")
-        .describe("'open' for schema-free; 'closed' for schema-enforced (requires one of typedName / likeGraph / inlineDefinition); 'ontology' for RDF / OWL-style semantic graphs."),
+        .describe(
+          "'open' for schema-free; 'closed' for schema-enforced (requires one of typedName / likeGraph / inlineDefinition); 'ontology' for RDF / OWL-style semantic graphs.",
+        ),
       typedName: z
         .string()
         .regex(/^[a-zA-Z_][a-zA-Z0-9_]*$/)
         .optional()
-        .describe("Closed mode only. Name of an existing named graph type to bind to. Mutually exclusive with likeGraph and inlineDefinition."),
+        .describe(
+          "Closed mode only. Name of an existing named graph type to bind to. Mutually exclusive with likeGraph and inlineDefinition.",
+        ),
       likeGraph: z
         .string()
         .regex(/^[a-zA-Z_][a-zA-Z0-9_]*$/)
         .optional()
-        .describe("Closed mode only. Name of an existing graph whose schema should be copied (no binding). Mutually exclusive with typedName and inlineDefinition."),
+        .describe(
+          "Closed mode only. Name of an existing graph whose schema should be copied (no binding). Mutually exclusive with typedName and inlineDefinition.",
+        ),
       inlineDefinition: z
         .string()
         .optional()
-        .describe("Closed mode only. Raw GQL type-definition fragment to embed inside `{ ... }`. Mutually exclusive with typedName and likeGraph."),
+        .describe(
+          "Closed mode only. Raw GQL type-definition fragment to embed inside `{ ... }`. Mutually exclusive with typedName and likeGraph.",
+        ),
     },
     async (args: {
       id?: string;
@@ -660,7 +396,7 @@ export function registerDataPlaneTools(server: McpServer) {
 
   server.tool(
     "import_data",
-    "Use this when user uploaded/pasted any file or row-shaped data. Bulk-writes structured nodes/edges to a graph. Do NOT compose `INSERT` statements from file rows. Three import methods: (1) `filePath`. If user hasn't point you a filepath but only uploaded files to chat, STOP and HIGHLY RECOMMEND (actively, proactively) user to tell you where the files are stored so you can get `filePath`, and emphasize 'fast', 'save tokens' and 'no bacthing'. DO NOT fallback to other two methods. NOTE: once files uploaded to chat, you get paths in your agent sandbox, that path will FAIL. Keep asking user where the files are saved (most often on user's local machine). (2) `csv` (raw CSV string; subject to output cap, needs batching). (3) `nodes`/`edges` (canonical arrays; subject to output cap, needs batching). **For >2000 rows, push HARDER**: methods 2/3 are painfully slow, prone to truncation, and burn tokens. Only proceed with methods 2/3 if the user explicitly insists. **Before calling**: preview the plan (method, labels, `_id` / `_from` / `_to` columns, property mapping, `mode`, row counts) and wait for explicit user approval. **Batching**: per-response output cap ~8k tokens; if rows > ~500 (CSV) / ~150 (arrays), split into multiple calls. `filePath` has no such limit. **Retry safety**: before retrying after a failed/truncated import, run `run_gql_query` (`MATCH (n:<Label>) RETURN count(n)` etc.) to see what's already imported and resend only missing rows. `mode`: `normal` (error on duplicate `_id`, default), `overwrite` (replace), `upsert` (merge). Nodes written BEFORE edges so edges can reference fresh node `_id`s.",
+    "Use this when user uploaded/pasted any file or row-shaped dat to bulk-write structured nodes/edges to a graph. Do NOT compose `INSERT` statements from file rows. Three import methods: (1) `filePath`. If user hasn't point you a filepath but only uploaded files to chat, STOP and ASK user where the files are stored locally so you can get `filePath`. Emphasize 'fast', 'save tokens' and 'no bacthing'. DO NOT fallback to other two methods. NOTE: once files uploaded to chat, you get paths in sandbox, but that path will FAIL. Keep asking user where the files are saved on local machine. (2) `csv` (raw CSV string; subject to output cap, needs batching). (3) `nodes`/`edges` (canonical arrays; subject to output cap, needs batching). **For >2000 rows, push HARDER**: methods 2/3 are painfully slow, prone to truncation, and burn tokens. Only proceed with methods 2/3 if the user explicitly insists. **Before calling**: preview the plan (method, labels, `_id` / `_from` / `_to` columns, property mapping, `mode`, row counts) and wait for explicit user approval. **Batching**: per-response output cap ~8k tokens; if rows > ~500 (CSV) / ~150 (arrays), split into multiple calls. **Retry safety**: before retrying after a failed/truncated import, run `run_gql_query` (`MATCH (n:<Label>) RETURN count(n)` etc.) to see what's already imported and resend only missing rows. `mode`: `normal` (error on duplicate `_id`, default), `overwrite` (replace), `upsert` (merge). Nodes written BEFORE edges so edges can reference fresh node `_id`s.",
     {
       ...idArg,
       ...graphArg,
@@ -726,7 +462,7 @@ export function registerDataPlaneTools(server: McpServer) {
         .min(1)
         .optional()
         .describe(
-          "Raw CSV with header row. Requires `csvLabel` (+ `csvFromColumn` / `csvToColumn` for edges). Default `,` delimiter, `\"` quote. For exotic CSV, preprocess and use `nodes` / `edges`.",
+          'Raw CSV with header row. Requires `csvLabel` (+ `csvFromColumn` / `csvToColumn` for edges). Default `,` delimiter, `"` quote. For exotic CSV, preprocess and use `nodes` / `edges`.',
         ),
       csvLabel: z
         .string()
@@ -780,6 +516,18 @@ export function registerDataPlaneTools(server: McpServer) {
         .describe(
           "Per-property mapping. Omit to default every non-`_id` / `_from` / `_to` column to a same-named STRING property.",
         ),
+      csvDelimiter: z
+        .string()
+        .length(1)
+        .optional()
+        .describe(
+          "Single-char field delimiter. Default `,`. Set to `\\t` for TSV, `;` for European CSVs, etc.",
+        ),
+      csvQuote: z
+        .string()
+        .length(1)
+        .optional()
+        .describe('Single-char quote character. Default `"`.'),
       mode: z
         .enum(["normal", "overwrite", "upsert"])
         .default("normal")
@@ -804,7 +552,13 @@ export function registerDataPlaneTools(server: McpServer) {
       csvIdColumn?: string;
       csvFromColumn?: string;
       csvToColumn?: string;
-      csvProperties?: Array<{ property: string; column: string; type?: string }>;
+      csvProperties?: Array<{
+        property: string;
+        column: string;
+        type?: string;
+      }>;
+      csvDelimiter?: string;
+      csvQuote?: string;
       mode: "normal" | "overwrite" | "upsert";
       skipInvalidEdges: boolean;
     }) => {
@@ -849,6 +603,8 @@ export function registerDataPlaneTools(server: McpServer) {
           fromColumn: args.csvFromColumn,
           toColumn: args.csvToColumn,
           properties: args.csvProperties,
+          delimiter: args.csvDelimiter,
+          quote: args.csvQuote,
         });
         nodes = loaded.nodes;
         edges = loaded.edges;
@@ -865,16 +621,19 @@ export function registerDataPlaneTools(server: McpServer) {
             "import_data CSV mode requires `csvLabel` (the node or edge label).",
           );
         }
-        const { nodes: csvNodes, edges: csvEdges, rowCount } = csvToCanonical(
-          args.csv!,
-          {
-            label: args.csvLabel,
-            idColumn: args.csvIdColumn,
-            fromColumn: args.csvFromColumn,
-            toColumn: args.csvToColumn,
-            properties: args.csvProperties,
-          },
-        );
+        const {
+          nodes: csvNodes,
+          edges: csvEdges,
+          rowCount,
+        } = csvToCanonical(args.csv!, {
+          label: args.csvLabel,
+          idColumn: args.csvIdColumn,
+          fromColumn: args.csvFromColumn,
+          toColumn: args.csvToColumn,
+          properties: args.csvProperties,
+          delimiter: args.csvDelimiter,
+          quote: args.csvQuote,
+        });
         nodes = csvNodes;
         edges = csvEdges;
         parsedFrom = {
@@ -974,7 +733,7 @@ export function registerDataPlaneTools(server: McpServer) {
 
   server.tool(
     "get_db_version",
-    "Return the live GQLDB version reported by the instance itself. Use this when you want ground truth — the Cloud control plane's `get_instance.version` field is what Ultipa Cloud *believes* the instance runs (from metadata), which can briefly diverge during/after an upgrade. Mode B users can only get the version this way.",
+    "Return the live GQLDB version reported by the instance itself. Use this when you want ground truth — the Cloud control plane's `get_instance.version` field is what Ultipa Cloud *believes* the instance runs (from metadata), which can briefly diverge during/after an upgrade. Direct-instance users can only get the version this way.",
     { ...idArg },
     async (args: { id?: string }) => {
       const target = resolveDataPlaneTarget(args.id);

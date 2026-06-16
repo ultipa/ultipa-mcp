@@ -20,10 +20,10 @@ const TOPICS = [
   "gql/graph-management/closed-graphs",
   // gql / data manipulation
   "gql/data-manipulation/node-and-edge-ids",
-  "gql/data-manipulation/insert", 
-  "gql/data-manipulation/insert-overwrite", 
-  "gql/data-manipulation/upsert", 
-  "gql/data-manipulation/merge", 
+  "gql/data-manipulation/insert",
+  "gql/data-manipulation/insert-overwrite",
+  "gql/data-manipulation/upsert",
+  "gql/data-manipulation/merge",
   "gql/data-manipulation/foreach",
   // gql / querying
   "gql/querying/query-composition",
@@ -199,7 +199,8 @@ export function registerDocsTools(server: McpServer) {
                     error: `Failed to fetch '${topic}' (${res.status} ${res.statusText}). Slug is likely wrong. **Next step**: call \`lookup_docs({ topic: "?" })\` to get the full live index of every doc page in the repo, locate the actual path for what you wanted, then re-call \`lookup_docs\` with the correct slug. Do NOT guess another slug blindly — the index is the authoritative list. As a fallback, the curated entry points below may also be close to what you need.`,
                     fetchedUrl,
                     fallbackUrl,
-                    nextStep: 'Call lookup_docs({ topic: "?" }) to fetch the full index.',
+                    nextStep:
+                      'Call lookup_docs({ topic: "?" }) to fetch the full index.',
                     curatedEntryPoints: TOPICS,
                   },
                   null,

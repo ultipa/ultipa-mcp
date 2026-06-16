@@ -30,9 +30,7 @@ export function registerBillingTools(server: McpServer) {
         ),
     },
     async ({ month }) =>
-      json(
-        await api(`/v1/billing/usage${month ? `?month=${month}` : ""}`),
-      ),
+      json(await api(`/v1/billing/usage${month ? `?month=${month}` : ""}`)),
   );
 
   server.tool(

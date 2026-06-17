@@ -295,6 +295,19 @@ Works with either Ultipa Cloud or a Direct instance.
 
 For agent-side trace debugging, set `ULTIPA_MCP_DEBUG=1` in the MCP env to log every tool call name + latency to stderr.
 
+## Privacy
+
+Ultipa MCP runs locally as a subprocess of your MCP client and is a thin client to Ultipa Cloud and/or the GQLDB instance you configure. It has no backend of its own and collects no analytics or telemetry.
+
+- **Credentials** (`ULTIPA_CLOUD_API_KEY`, or `ULTIPA_HOST` / `ULTIPA_USERNAME` / `ULTIPA_PASSWORD`) are read from your MCP client's configuration and used only to authenticate requests to the Ultipa target you configure. They are never logged, persisted, or sent anywhere else.
+- **Queries and data** you act on (GQL you run, records you import, etc.) are transmitted only to that configured Ultipa Cloud account or GQLDB instance, to carry out the tool call you invoked. Results are returned to your MCP client and are not retained by this server.
+- **No conversation data** is accessed or collected — the server never reads your chat history, memory, or local files, except file paths you explicitly pass to `import_data`.
+- **Third parties:** data sent to Ultipa Cloud / your instance is handled under Ultipa's [Privacy Policy](https://www.ultipa.com/legal/privacy). The `lookup_docs` tool fetches public documentation pages from GitHub (`ultipa/ultipa-docs`).
+- **Diagnostics:** `ULTIPA_MCP_DEBUG=1` logs tool names + latency to stderr (local only); off by default.
+- **Retention:** none by this server. **Questions:** open an issue at [github.com/ultipa/ultipa-mcp/issues](https://github.com/ultipa/ultipa-mcp/issues).
+
+Full Ultipa privacy policy: <https://www.ultipa.com/legal/privacy>
+
 ## License
 
 ISC

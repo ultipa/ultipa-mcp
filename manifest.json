@@ -15,6 +15,7 @@
   "support": "https://github.com/ultipa/ultipa-mcp/issues",
   "license": "ISC",
   "keywords": ["ultipa", "gqldb", "graph-database", "gql", "mcp"],
+  "privacy_policies": ["https://www.ultipa.com/legal/privacy"],
   "repository": {
     "type": "git",
     "url": "https://github.com/ultipa/ultipa-mcp"

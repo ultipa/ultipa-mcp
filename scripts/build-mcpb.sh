@@ -10,7 +10,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STAGE="$ROOT/mcpb-build"
-OUT="$ROOT/gqldb-mcp.mcpb"
+# Output path. CI overrides this with a tag-matched, versioned name
+# (e.g. gqldb-mcp-1.1.0.mcpb) via MCPB_OUT; local builds get the plain name.
+OUT="${MCPB_OUT:-$ROOT/gqldb-mcp.mcpb}"
 MCPB="@anthropic-ai/mcpb@latest"
 
 cd "$ROOT"

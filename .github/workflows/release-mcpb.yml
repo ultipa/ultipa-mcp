@@ -1,0 +1,82 @@
+name: Release MCPB
+
+# Builds the .mcpb bundle and attaches it to a GitHub Release whenever a
+# release tag is pushed. This is the asset Anthropic's MCP Directory pulls
+# from — the exact .mcpb published here is what users install (Anthropic does
+# not rebuild from source).
+#
+# Tag convention: gqldb-mcp-<version>  (e.g. gqldb-mcp-1.1.0)
+# The .mcpb filename matches the tag exactly: gqldb-mcp-1.1.0.mcpb
+#
+# Release flow:
+#   1. Bump "version" in package.json and commit.
+#   2. git tag gqldb-mcp-1.1.0 && git push origin gqldb-mcp-1.1.0
+#   3. This workflow validates, packs, and publishes the Release asset.
+
+on:
+  push:
+    tags:
+      - 'gqldb-mcp-[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to build (e.g. gqldb-mcp-1.1.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#gqldb-mcp-}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify tag matches package.json version
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$PKG_VERSION" != "${{ steps.tag.outputs.version }}" ]; then
+            echo "::error::Tag ${{ steps.tag.outputs.tag }} implies version ${{ steps.tag.outputs.version }}, but package.json is $PKG_VERSION. Bump and commit package.json before tagging."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and pack .mcpb
+        env:
+          # build-mcpb.sh validates the manifest, installs prod deps, and packs.
+          MCPB_OUT: ${{ github.workspace }}/${{ steps.tag.outputs.tag }}.mcpb
+        run: npm run build:mcpb
+
+      - name: Publish GitHub Release with bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          ASSET="$TAG.mcpb"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ASSET" --clobber
+          else
+            gh release create "$TAG" "$ASSET" --title "$TAG" --generate-notes
+          fi

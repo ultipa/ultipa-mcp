@@ -5,22 +5,22 @@ name: Release MCPB
 # from — the exact .mcpb published here is what users install (Anthropic does
 # not rebuild from source).
 #
-# Tag convention: gqldb-mcp-<version>  (e.g. gqldb-mcp-1.1.0)
-# The .mcpb filename matches the tag exactly: gqldb-mcp-1.1.0.mcpb
+# Tag convention: <version>  (e.g. 1.1.0)
+# The published bundle is named gqldb-mcp-<version>.mcpb (e.g. gqldb-mcp-1.1.0.mcpb)
 #
 # Release flow:
 #   1. Bump "version" in package.json and commit.
-#   2. git tag gqldb-mcp-1.1.0 && git push origin gqldb-mcp-1.1.0
+#   2. git tag 1.1.0 && git push origin 1.1.0
 #   3. This workflow validates, packs, and publishes the Release asset.
 
 on:
   push:
     tags:
-      - 'gqldb-mcp-[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing release tag to build (e.g. gqldb-mcp-1.1.0)'
+        description: 'Existing release tag to build (e.g. 1.1.0)'
         required: true
 
 permissions:
@@ -39,7 +39,7 @@ jobs:
             TAG="${GITHUB_REF_NAME}"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#gqldb-mcp-}" >> "$GITHUB_OUTPUT"
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -66,7 +66,7 @@ jobs:
       - name: Build and pack .mcpb
         env:
           # build-mcpb.sh validates the manifest, installs prod deps, and packs.
-          MCPB_OUT: ${{ github.workspace }}/${{ steps.tag.outputs.tag }}.mcpb
+          MCPB_OUT: ${{ github.workspace }}/gqldb-mcp-${{ steps.tag.outputs.version }}.mcpb
         run: npm run build:mcpb
 
       - name: Publish GitHub Release with bundle
@@ -74,7 +74,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
-          ASSET="$TAG.mcpb"
+          ASSET="gqldb-mcp-${{ steps.tag.outputs.version }}.mcpb"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "$ASSET" --clobber
           else
